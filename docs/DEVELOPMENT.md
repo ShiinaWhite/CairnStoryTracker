@@ -4,13 +4,14 @@ Audience: future maintainers / AI coding agents working on this mod.
 This document records **runtime-verified architecture conclusions** and the reasons
 behind them. It is not a line-by-line source walkthrough.
 
-Stable baseline: **v0.3.18**.
+Stable baseline: **v0.3.18** (v0.4.0 builds on it; owner runtime verification of the
+persistence features is still pending — see §14).
 
 ---
 
 ## 1. Current stable state
 
-Runtime-verified by the project owner (in-game):
+Runtime-verified by the project owner (in-game, up to v0.3.18):
 
 - Bear read → `i` marker disappears (same session)
 - Mapboard (公告板) fully read → `?` disappears
@@ -19,7 +20,9 @@ Runtime-verified by the project owner (in-game):
 - No native quick-travel marker pollution (`nativeWarpPointCount` unchanged)
 - The severe post-interaction frame hitch is resolved (v0.3.18 perf model)
 
-Do not claim anything beyond this list as runtime-verified.
+v0.4.0 (persistent exploration memory) has passed build + minimal startup smoke
+test only (mod loads, zero exceptions, no user save entered). Do not claim any
+v0.4.0 persistence behavior as runtime-verified until the owner confirms it.
 
 ## 2. Product principles
 
@@ -33,31 +36,48 @@ One actual lore POI should render one marker. Group by the level's
 `*_Lore` hierarchy, not per readable object.
 
 ### Collectible-backed lore
-- Collectible tracking / X/Y is kept untouched
+- Collectible classification / eligibility is kept untouched
 - The visual marker is merged into the lore marker (no `?`+`*` duplicates)
 - Identity is the stable persistent ID, never coordinates or name strings
 
-### No custom persistent read state
-The mod deliberately does not persist its own "has been read" state. Game saves
-can roll back; a mod-side persistent read log would desync from the game save.
-Non-persistent readables use **session-only state**: after restart, their markers
-reappear. This is design behavior, not a bug.
+### Persistent monotonic exploration memory (v0.4.0)
+The tracker records **player exploration knowledge**, not a mirror of the
+current game save. Design rationale:
+
+- Native save state can **add** completion evidence; it can **never remove**
+  completion. If the tracker says completed and the save rolls back, the
+  tracker stays completed (rollback must not resurrect explored markers).
+- Lore persistence is **member-level**: the file stores each completed
+  `scene|path` member key, not group-completed booleans. If a future game
+  update adds a new member to a group, the group naturally reappears `?`
+  while old members stay completed.
+- Collectible persistence uses the **stable `UniquePersistentID`** — never
+  coordinates or names.
+- **No automatic reset**: no per-site/zone/all reset, no new-game detection,
+  no save-slot coupling yet. Manual deletion of `progress.json` IS the reset.
+- Old v0.3.x history for nonpersistent readables is unrecoverable (the game
+  itself does not remember it); those markers may reappear once after
+  upgrading, then persist from v0.4.0 on.
 
 ## 3. Data sources
 
 ### Collectible (special exploration items)
 - Source: `CairnAPI.ItemLocations` (`Enumerate()` / stable `UniquePersistentID`)
 - Fields used: `Id`, `Position`, `SceneName`, `Items`, `remaining` / `StocksEmpty`
-- X/Y progress comes **only** from tracked collectibles (current
-  classified families: letters, maps, GabRob, doll parts, flyers, journal,
-  crystal shards…)
+- The classification families (letters, maps, GabRob, doll parts, flyers,
+  journal, crystal shards…) still decide eligibility and lore-merge dedup.
+  Since v0.4.0 there is no X/Y UI anymore — the classification feeds marker
+  eligibility, not a numeric progress panel.
 
 ### ReadInteractionProvider
 World readable carrier for provider-backed objects (notes on walls, sign posts).
-- Persistent providers: `InteractionCount > 0` = read (authoritative, save-backed)
-- Non-persistent providers: session state only
+- Persistent providers: `InteractionCount > 0` is one completion **evidence**
+  source (v0.4.0) — alongside persistent tracker memory and session memory;
+  it is no longer the reverse authority
 - Correlation: `GameEventManager.OnInteractEnterWithReadInteractionProvider`
-  records the exact provider key; the following `READ STOP` marks it read
+  records the exact provider key (shared `HierarchyPath` helper — event path
+  and scan path MUST produce the same `scene|path` key); the following
+  `READ STOP` marks it read **and** stores it in persistent memory
   (see `OnStopReading`)
 
 ### FocusInteractionElement
@@ -68,12 +88,13 @@ Second reading entry (e.g. the Mapboard poster board).
   (stable PID matches the collectible ItemLocation id)
 - Reads are correlated **deferred** (v0.3.18): `READ STOP` records only
   `{ReadDataPointer, playerPos}`; `BuildLoreGroups()`'s FIE pass resolves
-  pointer identity + interaction-distance. **Unique match only** marks read;
-  zero or multiple matches stay unread (never guess)
+  pointer identity + interaction-distance. **Unique match only** marks read
+  (and since v0.4.0 also writes persistent memory); zero or multiple matches
+  stay unread (never guess)
 
 ### StoryEventSensor
 Diagnostics only (F8 + `READ`/`STORY` logging). Never use it to decide story
-markers or X/Y: runtime sampling found heavy tutorial/process trigger noise
+markers: runtime sampling found heavy tutorial/process trigger noise
 (`Tuto_Jump_Crag_*` etc.), so sensor state does not reliably represent optional
 narrative completion.
 
@@ -122,13 +143,17 @@ GroupPending =
 (v0.3.18 fix; the previous loop ignored covered-remaining and ignored
 session-read for non-persistent providers).
 
+Since v0.4.0 `CollectibleRemaining` uses the tracker's final completion
+semantics: if the persistent memory contains the ID, the collectible counts as
+completed even when the live world claims it is still there.
+
 Glyphs:
 
 - Pure collectible: `*`
 - Collectible-backed NarrativePoi: `?`
 - Collectible-backed WorldInfo: `i`
 
-Collectible data still participates in X/Y; merging is display-only.
+Merging is display-only; classification is unchanged.
 
 ## 7. Marker anchoring (FROZEN — historical reasons documented to prevent regression)
 
@@ -177,15 +202,11 @@ Principle: **pure visual only**. `nativeWarpPointCount` before/after is logged
 by F8 as the pollution watchdog. Do not "simplify" this back into registering a
 `FreeRoamWarpPoint`.
 
-## 9. Performance model (v0.3.18)
+## 9. Performance model (v0.3.18) + persistence writer (v0.4.0)
 
-Before: `READ STOP` / `ITEM LOOTED` / scene load scheduled a delayed full
-rebuild (`RebuildProgress` + `BuildLoreGroups`, several `FindObjectsOfType`
-sweeps + hierarchy reconstruction) on the main thread right after the player
-finished interacting — measurable frame hitch, confirmed by A/B (DLL removed →
-hitch gone).
-
-Now:
+Events (`READ STOP` / `ITEM LOOTED` / scene load) only flag the model dirty;
+the full scans run once when the player opens a marker surface (L1 / eagle
+map) or presses F8:
 
 ```text
 event → MarkModelDirty()   (flag only)
@@ -194,25 +215,67 @@ refresh → EnsureModelFresh(reason)
            BuildLoreGroups()
 ```
 
-Refresh happens only when the player opens a marker surface (L1 / eagle map)
-or presses F8.
-
 One measured dirty-refresh sample at L1 open: `progressMs ≈ 58`, `loreMs ≈ 76`,
 `totalMs ≈ 134`. This is one concrete measurement, not a performance guarantee.
 Current conclusion: the single L1-open hitch is acceptable; do not re-architect
 performance without new evidence.
 
+Persistence I/O never runs inside an interaction hot path:
+
+```text
+completion event → HashSet add (in-memory, immediate)
+                 → MarkProgressDirty() (flag + debounce timestamp only)
+OnUpdate: TickProgressPersistence()
+          → after a short debounce, snapshot the HashSets (plain .NET data)
+          → one background writer serializes + writes tmp + moves over
+            progress.json
+shutdown → OnDeinitializeMelon does one final synchronous flush
+```
+
+The background thread touches ONLY the plain-data snapshot (strings/ulongs).
+One writer at a time; if a new revision arrives mid-write, the dirty flag
+survives and the next tick schedules the follow-up save.
+
 ## 10. F8 diagnostics
 
 F8 is a developer diagnostic tool, not a runtime hot path. One snapshot dumps:
-story events, item locations (with tracked/reason), lore groups
-(rawMembers/effectiveMembers/covered), RawCategory, LoreUnread,
-CoveredRemaining, GroupPending, anchors, FIE collider/renderer spatial data,
-native warp point counts, and model refresh timing.
+story events, item locations (with tracked/reason/`completedSource`), lore
+groups (rawMembers/effectiveMembers/covered, member `readSource`
+native/persistent/session/unread), RawCategory, LoreUnread, CoveredRemaining,
+GroupPending, anchors, FIE collider/renderer spatial data, native warp point
+counts, model refresh timing, and — since v0.4.0 — a **Persistence** section:
+file path, load state, schema versions, persistent lore/collectible counts,
+dirty flag, writer busy state, last save result.
 
 F8 itself is heavy: one measured snapshot ≈ 275 ms — expected debugging cost.
 
-## 11. Frozen / do-not-regress areas
+## 11. Persistence file (v0.4.0)
+
+`<game>/UserData/CairnStoryTracker/progress.json`, schema v1:
+
+```json
+{
+  "schemaVersion": 1,
+  "completedLoreMembers": ["02_Crag_Gameplay|SceneRoot/Crag_Lore/…"],
+  "completedCollectibles": ["8020028534801096432"]
+}
+```
+
+- Lore: one entry per completed **member key** (`scene|path`, built by the
+  shared `HierarchyPath` helper) — never group-completed booleans
+- Collectibles: decimal **strings** (avoids 64-bit JSON integer issues);
+  in-memory `HashSet<ulong>`
+- NOT stored (always recomputed from the live world model): marker screen
+  positions, anchors, categories, glyphs, zone progress, player position
+- Writes: debounced (~2 s), background thread, tmp file + `File.Move(overwrite)`
+- Missing file = empty memory (fresh start), created on first save
+- Corrupt file: warning, file left untouched, writes disabled for the session
+  (`PERSISTENCE LOAD FAILED` in the log) — never auto-reset
+- `schemaVersion > 1`: same protective behavior, format never guessed
+- Hand-rolled serializer/parser (unit-tested offline for round-trip and
+  corrupt-input rejection); no JSON library dependency
+
+## 12. Frozen / do-not-regress areas
 
 Unless new raw F8/runtime evidence proves a regression, do not refactor:
 
@@ -220,14 +283,14 @@ Unless new raw F8/runtime evidence proves a regression, do not refactor:
 - Provider anchor (`transform.position`)
 - Group centroid / nearest-member anchor
 - Quick-travel pure-visual safety (hidden driver + inactive widget + TMP visual)
-- Session-only nonpersistent readable design
 - RawCategory computed pre-dedup
 - Collectible-backed lore merge (stable PID identity)
 - GroupPending visibility
+- Deferred FIE unique-match-only correlation
 - Dirty-on-event / refresh-on-L1 performance model
-- X/Y only for reliably persisted special collectibles
+- Persistence write path: no synchronous file I/O in interaction handlers
 
-## 12. Known issues / low-priority TODO
+## 13. Known issues / low-priority TODO
 
 - **F8 standalone count diagnostic**: can report
   `standalone=-1` with `mergedIntoLore=2`. The summary subtracts covered lore
@@ -242,7 +305,7 @@ Unless new raw F8/runtime evidence proves a regression, do not refactor:
   with new zones, investigate incremental caching / scene-scoped scans /
   avoiding repeated hierarchy reconstruction. Not scheduled.
 
-## 13. Validation workflow
+## 14. Validation workflow
 
 For any change, the AI executor must:
 
@@ -254,4 +317,5 @@ For any change, the AI executor must:
 
 Do NOT enter the owner's save; in-game verification is done by the owner.
 Never claim marker/readable/save-dependent behavior is "verified" unless the
-owner confirmed it in game.
+owner confirmed it in game. v0.4.0 persistence behavior (bootstrap absorption,
+rollback survival, file contents) is still awaiting that owner verification.

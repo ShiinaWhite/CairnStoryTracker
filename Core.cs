@@ -1,8 +1,11 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
 using System.Linq;
-using System.Text.RegularExpressions;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using CairnAPI;
 using Il2Cpp;
 using Il2CppTheGameBakers.Cairn;
@@ -14,14 +17,17 @@ using UnityEngine;
 using UnityEngine.InputSystem;
 using UnityEngine.UI;
 
-[assembly: MelonInfo(typeof(CairnStoryTracker.Core), "CairnStoryTracker", "0.3.18", "runtime-recon")]
+[assembly: MelonInfo(typeof(CairnStoryTracker.Core), "CairnStoryTracker", "0.4.0", "runtime-recon")]
 [assembly: MelonGame("TheGameBakers", "Cairn")]
 
 namespace CairnStoryTracker
 {
     /// <summary>
-    /// V1: zone-grouped collectible progress, shown while the eagle-eye map is open.
-    /// F8 diagnostics kept from V0; story events remain diagnostics-only (not counted).
+    /// v0.4.0: the tracker records player exploration knowledge, not a mirror of the
+    /// current game save. The markers (? i *) ARE the progress system; completions are
+    /// monotonic and persist to UserData/CairnStoryTracker/progress.json. Native save
+    /// state can ADD completion evidence, never remove it. Story events remain
+    /// diagnostics-only (not counted).
     /// </summary>
     public class Core : MelonMod
     {
@@ -37,15 +43,6 @@ namespace CairnStoryTracker
         private bool _snapshotBusy;
 
         // ------------------------------------------------------------ V1 state
-        private sealed class ZoneProgress
-        {
-            public string Key;
-            public string Display;
-            public int Total;
-            public int Done;
-            public bool Current;
-            public readonly HashSet<string> Scenes = new HashSet<string>();
-        }
 
         // Collectible ID families: deliberate small allowlist of story/exploration
         // item series (recon: InventoryItemStringIdEnum, 316 entries).
@@ -61,11 +58,6 @@ namespace CairnStoryTracker
             new KeyValuePair<string, string>("ITEM_MAP_", "Map"),
         };
 
-        private GameObject _uiCanvas;
-        private GameObject _uiRoot;
-        private RectTransform _uiRootRect;
-        private TextMeshProUGUI _uiText;
-        private bool _uiBroken;
         private EagleEyeUI _eagleEye;
         private float _nextEagleLookupAt;
         private bool _eagleWasShown;
@@ -97,25 +89,9 @@ namespace CairnStoryTracker
         private Il2CppSystem.Action<Il2Cpp.ReadInteractionDataBase> _il2cppStopReading;
         private Il2CppSystem.Action<Il2Cpp.ReadInteractionProvider> _il2cppEnterProvider;
 
-        private readonly List<ZoneProgress> _zones = new List<ZoneProgress>();
         private readonly Dictionary<ulong, KeyValuePair<bool, string>> _classification =
             new Dictionary<ulong, KeyValuePair<bool, string>>();
 
-        // Official localized zone names resolved through the game's LocalizationManager,
-        // cached per group key ("02_Crag" -> official current-language name).
-        private readonly Dictionary<string, string> _officialZoneNames = new Dictionary<string, string>();
-
-        // 暂定中文映射：仅在运行时官方本地化不可用时才会显示（主路径是官方中文）。
-        private static readonly Dictionary<string, string> ZoneNameFallbackZh = new Dictionary<string, string>
-        {
-            ["01_FirstRidge"] = "第一道山脊",
-            ["02_Crag"] = "峭壁",
-            ["03_Chimney"] = "烟囱",
-        };
-
-        private Il2Cpp.ZoneSceneData _currentZone;
-        private int _trackedTotal;
-        private int _trackedDone;
         private bool _modelDirty = true; // events only flag; refresh happens on L1 open / F8
 
         private sealed class PendingFocusRead
@@ -226,6 +202,25 @@ namespace CairnStoryTracker
         private readonly Dictionary<ulong, (string groupIdentity, LoreCategory rawCategory)> _collectibleCoveredByLore =
             new Dictionary<ulong, (string, LoreCategory)>(); // stable PID -> merged into lore marker
 
+        // ------------------------------------------------- v0.4.0 persistent exploration memory
+        // Monotonic: completions are added, never removed. The game save is completion
+        // EVIDENCE, not a rollback authority. Flushed to progress.json by a debounced
+        // background writer — never synchronously inside an interaction path.
+        private const int ProgressSchemaVersion = 1;
+        private const float ProgressDebounceSeconds = 2f;
+        private string _progressDir;
+        private string _progressFilePath;
+        private string _progressLoadState = "not initialized";
+        private int _progressLoadedSchemaVersion = -1;    // schema the file had on load (-1 = no file)
+        private bool _progressWriteBlocked;               // corrupt / newer schema: never write this session
+        private readonly HashSet<string> _persistentReadKeys = new HashSet<string>();
+        private readonly HashSet<ulong> _persistentCollectibleIds = new HashSet<ulong>();
+        private volatile bool _progressWriterBusy;        // at most one background writer at a time
+        private bool _progressFileDirty;
+        private bool _progressWasBusy;                    // busy transition watcher (main thread)
+        private float _progressSaveNotBefore;             // debounce window
+        private string _progressLastSaveResult = "no save attempted yet";
+
         private MelonPreferences_Category _prefsCat;
         private MelonPreferences_Entry<bool> _prefShowNarrative;
         private MelonPreferences_Entry<bool> _prefShowWorldInfo;
@@ -275,11 +270,14 @@ namespace CairnStoryTracker
                 MelonLogger.Warning("preferences init failed (defaults assumed visible): " + e.Message);
                 _prefShowNarrative = _prefShowWorldInfo = _prefShowCollectible = null;
             }
-            MelonLogger.Msg("V1 ready. Eagle-eye shows collectible progress; F8 dumps a zone snapshot.");
+            InitProgressPersistence();
+            MelonLogger.Msg("v0.4.0 ready. Markers (? i *) are the progress system; exploration memory is monotonic and persisted. F8 dumps a snapshot.");
         }
 
         public override void OnDeinitializeMelon()
         {
+            FlushProgressFileNow(); // final synchronous flush; the game is exiting
+
             try
             {
                 if (_subscribedManager != null && _il2cppStoryEnd != null)
@@ -298,7 +296,6 @@ namespace CairnStoryTracker
             }
             catch { }
 
-            TearDownPanel();
             TeardownMarkers();
             TeardownSurvey();
             UnsubscribeReadEvents();
@@ -375,16 +372,40 @@ namespace CairnStoryTracker
 
         private static string MemberKey(string scene, string path) { return scene + "|" + path; }
 
-        private bool MemberIsRead(LoreMember m)
+        /// <summary>
+        /// Canonical hierarchy path (root -&gt; ... -&gt; the object), max 24 ancestors.
+        /// MUST be used by both the event path (OnEnterReadProvider) and the scan path
+        /// (BuildLoreGroups) so one provider always yields one scene|path member key.
+        /// </summary>
+        private static List<string> HierarchySegments(Transform t)
         {
-            // persistent providers: native count is authoritative
+            var segs = new List<string> { t.gameObject.name };
+            var p = t.parent;
+            for (int d = 0; d < 24 && p != null; d++, p = p.parent) segs.Insert(0, p.name);
+            return segs;
+        }
+
+        private static string HierarchyPath(Transform t) { return string.Join("/", HierarchySegments(t)); }
+
+        /// <summary>
+        /// Where a member's completed state comes from (F8 diagnostics + read rule):
+        /// native save evidence, persistent tracker memory, current session memory,
+        /// or unread. Native state is one completion source among three — never a
+        /// rollback authority (tracker memory is never removed because the game
+        /// un-read something).
+        /// </summary>
+        private string MemberReadSource(LoreMember m)
+        {
             if (m.IsProvider && m.IsPersistent)
             {
-                try { if (m.InteractionCount > 0) return true; } catch { }
+                try { if (m.InteractionCount > 0) return "native"; } catch { }
             }
-            // everything else: session-read memory (unknown state stays unread = visible)
-            return _sessionReadKeys.Contains(m.Key);
+            if (_persistentReadKeys.Contains(m.Key)) return "persistent";
+            if (_sessionReadKeys.Contains(m.Key)) return "session";
+            return "unread";
         }
+
+        private bool MemberIsRead(LoreMember m) { return MemberReadSource(m) != "unread"; }
 
         private Vector3 GetMemberPos(LoreMember m) { return m.Pos; }
 
@@ -418,6 +439,8 @@ namespace CairnStoryTracker
             }
 
             // collectible identity map: LootProvider persistentId -> still has loot?
+            // v0.4.0: tracker memory wins over the live world — if the tracker recorded
+            // the collectible as obtained, a world rollback must not resurrect it.
             var collectibleRemaining = new Dictionary<ulong, bool>();
             try
             {
@@ -430,6 +453,7 @@ namespace CairnStoryTracker
                         if (pid == 0) continue;
                         bool remaining = true;
                         try { remaining = !lp.StocksEmpty; } catch { }
+                        if (remaining && _persistentCollectibleIds.Contains(pid)) remaining = false;
                         collectibleRemaining[pid] = remaining;
                     }
                     catch { }
@@ -449,12 +473,7 @@ namespace CairnStoryTracker
                         try { scene = rp.gameObject.scene.name; } catch { }
                         if (!IsGameplayScene(scene)) continue;
 
-                        var segs = new List<string> { rp.gameObject.name };
-                        var t = rp.transform.parent;
-                        for (int d = 0; d < 24 && t != null; d++, t = t.parent)
-                        {
-                            segs.Insert(0, t.name);
-                        }
+                        var segs = HierarchySegments(rp.transform);
                         string loreRoot = null, poiGroup = null;
                         Transform groupT = null;
                         for (int i = 0; i < segs.Count; i++)
@@ -478,6 +497,10 @@ namespace CairnStoryTracker
                         bool persistent = false; int count = -1;
                         try { persistent = rp.IsPersistent; } catch { }
                         try { count = rp.InteractionCount; } catch { }
+
+                        // v0.4.0 bootstrap: native-proven completions join the tracker's
+                        // monotonic memory (first v0.4.0 run absorbs the current save).
+                        if (persistent && count > 0) RememberLoreMemberRead(MemberKey(scene, path));
 
                         var pid = rp.UniquePersistentID;
                         var covered = pid != 0 &&
@@ -530,9 +553,7 @@ namespace CairnStoryTracker
                         try { scene = fie.gameObject.scene.name; } catch { }
                         if (!IsGameplayScene(scene)) continue;
 
-                        var segs = new List<string> { fie.gameObject.name };
-                        var t = fie.transform.parent;
-                        for (int d = 0; d < 24 && t != null; d++, t = t.parent) segs.Insert(0, t.name);
+                        var segs = HierarchySegments(fie.transform);
                         string loreRoot = null, poiGroup = null;
                         for (int i = 0; i < segs.Count; i++)
                         {
@@ -611,6 +632,7 @@ namespace CairnStoryTracker
                     if (matchCount == 1 && match != null)
                     {
                         _sessionReadKeys.Add(match.Key);
+                        RememberLoreMemberRead(match.Key); // v0.4.0: monotonic memory
                         MelonLogger.Msg("SESSION READ (focus, deferred): " + match.Key);
                     }
                     else
@@ -788,10 +810,11 @@ namespace CairnStoryTracker
                 string t = null;
                 try { t = data != null ? data.GetIl2CppType().Name : null; } catch { }
 
-                // session-read marking (memory only)
+                // session-read marking + persistent memory (v0.4.0)
                 if (_pendingProviderKey != null)
                 {
                     _sessionReadKeys.Add(_pendingProviderKey);
+                    RememberLoreMemberRead(_pendingProviderKey);
                     MelonLogger.Msg("SESSION READ (provider): " + _pendingProviderKey);
                     _pendingProviderKey = null;
                 }
@@ -822,19 +845,13 @@ namespace CairnStoryTracker
             {
                 if (provider == null) return;
                 string path = "?";
-                try
-                {
-                    var sb = new System.Text.StringBuilder(provider.gameObject.name);
-                    var t = provider.transform.parent;
-                    for (int d = 0; d < 6 && t != null; d++, t = t.parent) sb.Insert(0, t.name + "/");
-                    path = sb.ToString();
-                }
-                catch { }
+                try { path = HierarchyPath(provider.transform); } catch { }
                 _currentProviderDesc = provider.gameObject.name + " | path=" + path +
                                       " | pos=" + Fmt(provider.transform.position);
                 try
                 {
                     var scene = provider.gameObject.scene.name;
+                    // Same construction as BuildLoreGroups: one provider, one scene|path key.
                     _pendingProviderKey = MemberKey(scene, path);
                 }
                 catch { }
@@ -861,6 +878,7 @@ namespace CairnStoryTracker
             if (_eagleWasShown) DriveMarkers();
             TickSurvey();
             TickToast();
+            TickProgressPersistence();
         }
 
         // ---------------------------------------------------------------- hotkey
@@ -1048,12 +1066,351 @@ namespace CairnStoryTracker
                 string reason = _classification.TryGetValue(locationId, out var c2) ? c2.Value : "unknown";
                 MelonLogger.Msg("ITEM LOOTED: " + itemId + " @ location " + locationId +
                                 " (index " + itemIndex + ")" + (tracked ? " [tracked:" + reason + "]" : ""));
+                // v0.4.0: the stable locationId IS the persistent identity. If the
+                // classification is not established yet, do NOT guess — a later model
+                // refresh absorbs native-emptied tracked collectibles instead.
+                if (tracked) RememberCollectible(locationId);
             }
             catch (Exception e)
             {
                 MelonLogger.Warning("looted handler error: " + e.Message);
             }
             MarkModelDirty();
+        }
+
+        // ------------------------------------------------- v0.4.0 persistent exploration memory
+        // File: UserData/CairnStoryTracker/progress.json (path from the MelonLoader
+        // UserData API; the directory is created on demand). Writes are debounced and
+        // run on a background thread that only touches plain .NET data snapshots —
+        // never UnityEngine / IL2CPP objects. Main file is replaced atomically-ish via
+        // a full tmp write + move. No reset feature: deleting the file IS the reset.
+
+        private void InitProgressPersistence()
+        {
+            try
+            {
+                // MelonLoader 0.7.x official UserData path API (verified against the
+                // referenced MelonLoader.dll: MelonLoader.Utils.MelonEnvironment).
+                _progressDir = Path.Combine(MelonLoader.Utils.MelonEnvironment.UserDataDirectory, "CairnStoryTracker");
+                _progressFilePath = Path.Combine(_progressDir, "progress.json");
+            }
+            catch (Exception e)
+            {
+                _progressWriteBlocked = true;
+                _progressLoadState = "path resolution failed: " + e.Message;
+                MelonLogger.Warning("PERSISTENCE: UserData path resolution failed: " + e.Message);
+                return;
+            }
+            LoadProgressFile();
+        }
+
+        private void LoadProgressFile()
+        {
+            try
+            {
+                if (!File.Exists(_progressFilePath))
+                {
+                    _progressLoadState = "absent (fresh exploration memory)";
+                    MelonLogger.Msg("PERSISTENCE: no progress.json yet (" + _progressFilePath + ") — starting empty");
+                    return;
+                }
+
+                var json = File.ReadAllText(_progressFilePath);
+                if (!TryParseProgress(json, out var version, out var lore, out var ids))
+                {
+                    // Corrupt: keep the file untouched, never auto-overwrite it this session.
+                    _progressWriteBlocked = true;
+                    _progressLoadState = "LOAD FAILED (corrupt; writes disabled this session)";
+                    MelonLogger.Warning("PERSISTENCE LOAD FAILED: progress.json is corrupt — kept untouched, writes disabled for this session (delete the file manually to reset)");
+                    return;
+                }
+                if (version != ProgressSchemaVersion)
+                {
+                    // Newer schema: do not guess the format, do not write back.
+                    _progressWriteBlocked = true;
+                    _progressLoadedSchemaVersion = version;
+                    _progressLoadState = "unsupported schema v" + version + " (writes disabled this session)";
+                    MelonLogger.Warning("PERSISTENCE LOAD FAILED: progress.json schema v" + version +
+                                        " > supported v" + ProgressSchemaVersion + " — kept untouched, writes disabled for this session");
+                    return;
+                }
+
+                _progressLoadedSchemaVersion = version;
+                foreach (var k in lore) _persistentReadKeys.Add(k);
+                foreach (var id in ids) _persistentCollectibleIds.Add(id);
+                _progressLoadState = "loaded";
+                MelonLogger.Msg("PERSISTENCE: loaded " + _progressFilePath +
+                                " (schema v" + version +
+                                ", loreMembers=" + _persistentReadKeys.Count +
+                                ", collectibles=" + _persistentCollectibleIds.Count + ")");
+            }
+            catch (Exception e)
+            {
+                _progressWriteBlocked = true;
+                _progressLoadState = "LOAD FAILED (" + e.Message + ")";
+                MelonLogger.Warning("PERSISTENCE LOAD FAILED: " + e.Message);
+            }
+        }
+
+        private void RememberLoreMemberRead(string key)
+        {
+            if (string.IsNullOrEmpty(key)) return;
+            if (_persistentReadKeys.Add(key)) MarkProgressDirty();
+        }
+
+        private void RememberCollectible(ulong id)
+        {
+            if (id == 0) return;
+            if (_persistentCollectibleIds.Add(id)) MarkProgressDirty();
+        }
+
+        private void MarkProgressDirty()
+        {
+            if (_progressWriteBlocked) return; // memory stays monotonic; disk stays frozen
+            _progressFileDirty = true;
+            _progressSaveNotBefore = Time.unscaledTime + ProgressDebounceSeconds;
+        }
+
+        /// <summary>
+        /// Main-thread tick: after the debounce window, hand a plain-data snapshot to a
+        /// background writer. If new revisions arrive while a write is in flight, the
+        /// dirty flag stays set and the next tick schedules the follow-up save.
+        /// </summary>
+        private void TickProgressPersistence()
+        {
+            if (_progressWasBusy && !_progressWriterBusy &&
+                _progressLastSaveResult.StartsWith("FAILED", StringComparison.Ordinal))
+            {
+                MelonLogger.Warning("PERSISTENCE: background save failed — " + _progressLastSaveResult);
+            }
+            _progressWasBusy = _progressWriterBusy;
+
+            if (!_progressFileDirty || _progressWriterBusy) return;
+            if (Time.unscaledTime < _progressSaveNotBefore) return;
+            StartProgressSave();
+        }
+
+        private void StartProgressSave()
+        {
+            // Snapshot on the main thread: the writer thread sees only these copies.
+            var lore = new List<string>(_persistentReadKeys);
+            var ids = new List<ulong>(_persistentCollectibleIds);
+            var path = _progressFilePath;
+            var dir = _progressDir;
+            _progressFileDirty = false;
+            _progressWriterBusy = true;
+
+            Task.Run(() =>
+            {
+                string result;
+                try
+                {
+                    Directory.CreateDirectory(dir);
+                    var tmp = path + ".tmp"; // full write first, then replace the main file
+                    File.WriteAllText(tmp, SerializeProgress(lore, ids), new UTF8Encoding(false));
+                    File.Move(tmp, path, true);
+                    result = "saved (lore=" + lore.Count + " collectibles=" + ids.Count + ")";
+                }
+                catch (Exception e)
+                {
+                    result = "FAILED: " + e.Message;
+                }
+                _progressLastSaveResult = result;
+                _progressWriterBusy = false;
+            });
+        }
+
+        /// <summary>Final synchronous flush at shutdown (the game is exiting; blocking is fine).</summary>
+        private void FlushProgressFileNow()
+        {
+            if (_progressWriteBlocked || !_progressFileDirty) return;
+            for (int i = 0; i < 150 && _progressWriterBusy; i++) Thread.Sleep(20); // ≤3s: let an in-flight write finish
+            if (_progressWriterBusy)
+            {
+                MelonLogger.Warning("PERSISTENCE: background writer still busy at shutdown; final flush skipped");
+                return;
+            }
+            try
+            {
+                Directory.CreateDirectory(_progressDir);
+                var tmp = _progressFilePath + ".tmp";
+                File.WriteAllText(tmp,
+                    SerializeProgress(new List<string>(_persistentReadKeys), new List<ulong>(_persistentCollectibleIds)),
+                    new UTF8Encoding(false));
+                File.Move(tmp, _progressFilePath, true);
+                _progressFileDirty = false;
+                _progressLastSaveResult = "final flush saved (lore=" + _persistentReadKeys.Count +
+                                          " collectibles=" + _persistentCollectibleIds.Count + ")";
+                MelonLogger.Msg("PERSISTENCE: final flush saved " + _progressFilePath);
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Warning("PERSISTENCE: final flush failed: " + e.Message);
+            }
+        }
+
+        /// <summary>Deterministic, hand-rolled JSON (schema v1); collectible IDs are
+        /// decimal STRINGS to avoid 64-bit JSON integer issues.</summary>
+        internal static string SerializeProgress(List<string> loreKeys, List<ulong> collectibleIds)
+        {
+            loreKeys.Sort(StringComparer.Ordinal);
+            collectibleIds.Sort();
+            var sb = new StringBuilder();
+            sb.Append("{\n  \"schemaVersion\": ").Append(ProgressSchemaVersion).Append(",\n");
+            sb.Append("  \"completedLoreMembers\": [\n");
+            for (int i = 0; i < loreKeys.Count; i++)
+            {
+                sb.Append("    \"").Append(JsonEscape(loreKeys[i])).Append('"');
+                if (i < loreKeys.Count - 1) sb.Append(',');
+                sb.Append('\n');
+            }
+            sb.Append("  ],\n  \"completedCollectibles\": [\n");
+            for (int i = 0; i < collectibleIds.Count; i++)
+            {
+                sb.Append("    \"").Append(collectibleIds[i].ToString(CultureInfo.InvariantCulture)).Append('"');
+                if (i < collectibleIds.Count - 1) sb.Append(',');
+                sb.Append('\n');
+            }
+            sb.Append("  ]\n}\n");
+            return sb.ToString();
+        }
+
+        private static string JsonEscape(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return s;
+            var sb = new StringBuilder(s.Length);
+            foreach (var c in s)
+            {
+                switch (c)
+                {
+                    case '"': sb.Append("\\\""); break;
+                    case '\\': sb.Append("\\\\"); break;
+                    case '\b': sb.Append("\\b"); break;
+                    case '\f': sb.Append("\\f"); break;
+                    case '\n': sb.Append("\\n"); break;
+                    case '\r': sb.Append("\\r"); break;
+                    case '\t': sb.Append("\\t"); break;
+                    default:
+                        if (c < 0x20) sb.Append("\\u").Append(((int)c).ToString("x4", CultureInfo.InvariantCulture));
+                        else sb.Append(c);
+                        break;
+                }
+            }
+            return sb.ToString();
+        }
+
+        /// <summary>Strict small parser. Returns false on any structural deviation
+        /// (caller treats the file as corrupt). Unknown schema versions parse
+        /// successfully but are rejected by the caller — never interpreted.</summary>
+        internal static bool TryParseProgress(string json, out int schemaVersion,
+            out List<string> loreKeys, out List<ulong> collectibleIds)
+        {
+            schemaVersion = 0;
+            loreKeys = new List<string>();
+            collectibleIds = new List<ulong>();
+            if (string.IsNullOrWhiteSpace(json)) return false;
+            if (!TryReadIntField(json, "schemaVersion", out var v)) return false;
+            schemaVersion = v;
+            if (v != ProgressSchemaVersion) return true; // caller decides; do not guess the format
+
+            if (!TryReadStringArray(json, "completedLoreMembers", out loreKeys, out var loreFound)) return false;
+            if (!TryReadStringArray(json, "completedCollectibles", out var idStrings, out var idsFound)) return false;
+            if (!loreFound || !idsFound) return false; // a v1 file always has both fields
+            foreach (var s in idStrings)
+            {
+                if (!ulong.TryParse(s, NumberStyles.None, CultureInfo.InvariantCulture, out var id)) return false;
+                collectibleIds.Add(id);
+            }
+            return true;
+        }
+
+        private static int FieldIndex(string json, string name)
+        {
+            return json.IndexOf("\"" + name + "\"", StringComparison.Ordinal);
+        }
+
+        private static bool TryReadIntField(string json, string name, out int value)
+        {
+            value = 0;
+            var i = FieldIndex(json, name);
+            if (i < 0) return false;
+            i = json.IndexOf(':', i + name.Length + 2);
+            if (i < 0) return false;
+            i++;
+            while (i < json.Length && char.IsWhiteSpace(json[i])) i++;
+            var start = i;
+            while (i < json.Length && (char.IsDigit(json[i]) || json[i] == '-')) i++;
+            return int.TryParse(json.Substring(start, i - start), NumberStyles.Integer,
+                CultureInfo.InvariantCulture, out value);
+        }
+
+        private static bool TryReadStringArray(string json, string name, out List<string> values, out bool found)
+        {
+            values = new List<string>();
+            found = false;
+            var i = FieldIndex(json, name);
+            if (i < 0) return true; // field absent — caller decides whether that is legal
+            found = true;
+            i = json.IndexOf(':', i + name.Length + 2);
+            if (i < 0) return false;
+            i++;
+            while (i < json.Length && char.IsWhiteSpace(json[i])) i++;
+            if (i >= json.Length || json[i] != '[') return false; // value must BE the array
+            i++;
+            while (true)
+            {
+                while (i < json.Length && char.IsWhiteSpace(json[i])) i++;
+                if (i >= json.Length) return false;
+                var c = json[i];
+                if (c == ']') return true;
+                if (c == ',') { i++; continue; }
+                if (c != '"') return false;
+                if (!TryReadJsonString(json, i, out var s, out var next)) return false;
+                values.Add(s);
+                i = next;
+            }
+        }
+
+        private static bool TryReadJsonString(string json, int start, out string value, out int next)
+        {
+            value = null;
+            next = -1;
+            var sb = new StringBuilder();
+            var i = start + 1; // json[start] == '"'
+            while (i < json.Length)
+            {
+                var c = json[i];
+                if (c == '"') { value = sb.ToString(); next = i + 1; return true; }
+                if (c == '\\')
+                {
+                    i++;
+                    if (i >= json.Length) return false;
+                    switch (json[i])
+                    {
+                        case '"': sb.Append('"'); break;
+                        case '\\': sb.Append('\\'); break;
+                        case '/': sb.Append('/'); break;
+                        case 'b': sb.Append('\b'); break;
+                        case 'f': sb.Append('\f'); break;
+                        case 'n': sb.Append('\n'); break;
+                        case 'r': sb.Append('\r'); break;
+                        case 't': sb.Append('\t'); break;
+                        case 'u':
+                            if (i + 4 >= json.Length) return false;
+                            if (!int.TryParse(json.Substring(i + 1, 4), NumberStyles.HexNumber,
+                                CultureInfo.InvariantCulture, out var cp)) return false;
+                            sb.Append((char)cp);
+                            i += 4;
+                            break;
+                        default: return false;
+                    }
+                    i++;
+                    continue;
+                }
+                sb.Append(c);
+                i++;
+            }
+            return false;
         }
 
         // ------------------------------------------------------- progress (V1 core)
@@ -1085,23 +1442,12 @@ namespace CairnStoryTracker
 
         private void RebuildProgress()
         {
-            _zones.Clear();
             _classification.Clear();
             _eligible.Clear();
             _markerReason.Clear();
-            _trackedTotal = 0;
-            _trackedDone = 0;
 
             try
             {
-                _currentZone = null;
-                try
-                {
-                    var sm = StreamingManager.Instance;
-                    if (sm != null) _currentZone = sm.currentZone;
-                }
-                catch { }
-
                 var byId = new Dictionary<ulong, Il2Cpp.LootProvider>();
                 try
                 {
@@ -1110,7 +1456,6 @@ namespace CairnStoryTracker
                 }
                 catch { }
 
-                var groups = new Dictionary<string, ZoneProgress>();
                 var locs = ItemLocations.Enumerate();
 
                 foreach (var loc in locs)
@@ -1122,67 +1467,34 @@ namespace CairnStoryTracker
                     _classification[loc.Id] = cls;
                     if (!cls.Key) continue;
 
-                    _trackedTotal++;
-                    bool emptied = false;
-                    try { emptied = lp != null && lp.StocksEmpty; } catch { }
-                    if (emptied) _trackedDone++;
+                    bool nativeEmpty = false;
+                    try { nativeEmpty = lp != null && lp.StocksEmpty; } catch { }
 
-                    var scene = Safe(() => loc.SceneName, null) ?? "unknown";
-                    var key = GroupKey(scene);
+                    // v0.4.0: completed = native empty OR tracker memory. Tracker memory
+                    // wins over the live world — if the game world resurrects a
+                    // collectible the tracker already recorded, it stays completed.
+                    bool completed = nativeEmpty || _persistentCollectibleIds.Contains(loc.Id);
 
-                    if (!groups.TryGetValue(key, out var zp))
+                    // bootstrap: native-proven empties join the monotonic memory (the
+                    // first v0.4.0 run absorbs the current save's taken collectibles).
+                    if (nativeEmpty) RememberCollectible(loc.Id);
+
+                    if (completed)
                     {
-                        zp = new ZoneProgress { Key = key, Display = ResolveZoneDisplay(key, scene) };
-                        groups[key] = zp;
-                    }
-                    zp.Total++;
-                    if (emptied) zp.Done++;
-                    zp.Scenes.Add(scene);
-
-                    // V2: tracked + not yet emptied => eligible for a map "?" marker.
-                    // Same classification source as the zone X/Y above (consistency rule).
-                    if (emptied)
-                    {
-                        _markerReason[loc.Id] = "notRemaining";
+                        _markerReason[loc.Id] = nativeEmpty ? "notRemaining" : "persistentCompleted";
                     }
                     else
                     {
                         _markerReason[loc.Id] = "remaining";
+                        var scene = Safe(() => loc.SceneName, null) ?? "unknown";
                         _eligible.Add(new EligibleSpot { Id = loc.Id, Pos = loc.Position, Scene = scene });
                     }
                 }
-
-                _zones.AddRange(groups.Values);
-                foreach (var zp in _zones)
-                {
-                    zp.Current = zp.Scenes.Any(s => IsCurrentZoneScene(s));
-                }
-                _zones.Sort((a, b) =>
-                {
-                    if (a.Current != b.Current) return a.Current ? -1 : 1;
-                    return string.Compare(a.Display, b.Display, StringComparison.OrdinalIgnoreCase);
-                });
             }
             catch (Exception e)
             {
                 MelonLogger.Warning("progress rebuild failed: " + e.Message);
             }
-        }
-
-        private bool IsCurrentZoneScene(string sceneName)
-        {
-            if (_currentZone == null || string.IsNullOrEmpty(sceneName)) return false;
-            // F8 runtime evidence: ContainsSceneNamed over-matches (it also accepted
-            // neighbour zones while streaming). The streaming zone's own name
-            // ("02_Crag") is exactly our group key format, so match on it directly.
-            try
-            {
-                var zn = _currentZone.name;
-                if (!string.IsNullOrEmpty(zn))
-                    return string.Equals(GroupKey(sceneName), zn, StringComparison.OrdinalIgnoreCase);
-            }
-            catch { }
-            return false;
         }
 
         private KeyValuePair<bool, string> Classify(CairnAPI.ItemLocation loc, Il2Cpp.LootProvider lp)
@@ -1638,118 +1950,9 @@ namespace CairnStoryTracker
         }
 
         // ------------------------------------------------------------------- UI
-        // Minimal own layout: OverlayCanvas (CairnAPI helper) + one multiline TMP
-        // label with word wrap disabled and an explicit width. The FieldsPanel
-        // field grid collapsed to one character per line outside the debug menu,
-        // so it is not used for this text.
-
-        private void TearDownPanel()
-        {
-            try { if (_uiRoot != null) UnityEngine.Object.Destroy(_uiRoot); } catch { }
-            try { if (_uiCanvas != null) UnityEngine.Object.Destroy(_uiCanvas); } catch { }
-            _uiRoot = null;
-            _uiRootRect = null;
-            _uiText = null;
-            _uiCanvas = null;
-        }
-
-        private bool EnsurePanel()
-        {
-            if (_uiBroken) return false;
-            if (_uiText != null) return true;
-            try
-            {
-                // Own overlay canvas; scaler constants mirror CairnAPI's HudPanel.Build.
-                _uiCanvas = new GameObject("CairnStoryTracker.Canvas");
-                var canvas = _uiCanvas.AddComponent<Canvas>();
-                canvas.renderMode = RenderMode.ScreenSpaceOverlay;
-                canvas.sortingOrder = 500;
-                var scaler = _uiCanvas.AddComponent<CanvasScaler>();
-                scaler.uiScaleMode = CanvasScaler.ScaleMode.ScaleWithScreenSize;
-                scaler.referenceResolution = new Vector2(1920f, 1080f);
-                scaler.matchWidthOrHeight = 0.5f;
-
-                var root = new GameObject("CairnStoryTracker.Progress");
-                root.AddComponent<RectTransform>();
-                root.transform.SetParent(_uiCanvas.transform, false);
-                var rt = root.GetComponent<RectTransform>();
-                rt.anchorMin = new Vector2(0f, 1f);
-                rt.anchorMax = new Vector2(0f, 1f);
-                rt.pivot = new Vector2(0f, 1f);
-                rt.anchoredPosition = new Vector2(24f, -24f);
-                rt.sizeDelta = new Vector2(380f, 44f);
-
-                var backing = root.AddComponent<Image>();
-                backing.color = new Color(0f, 0f, 0f, 0.55f);
-                backing.raycastTarget = false;
-
-                var textGo = new GameObject("Text");
-                textGo.AddComponent<RectTransform>();
-                textGo.transform.SetParent(rt, false);
-                var trt = textGo.GetComponent<RectTransform>();
-                trt.anchorMin = Vector2.zero;
-                trt.anchorMax = Vector2.one;
-                trt.offsetMin = new Vector2(12f, 8f);
-                trt.offsetMax = new Vector2(-12f, -8f);
-
-                _uiText = textGo.AddComponent<TextMeshProUGUI>();
-                _uiText.font = Label.GameFont; // game font asset; has CJK glyphs
-                _uiText.fontSize = 26f;
-                _uiText.color = Color.white;
-                _uiText.alignment = TextAlignmentOptions.TopLeft;
-                _uiText.enableWordWrapping = false; // never wrap per character
-                _uiText.raycastTarget = false;      // never block map input
-
-                _uiRoot = root;
-                _uiRootRect = rt;
-                return true;
-            }
-            catch (Exception e)
-            {
-                TearDownPanel();
-                _uiBroken = true;
-                MelonLogger.Warning("progress panel creation failed (UI disabled until next eagle-eye open): " + e.Message);
-                return false;
-            }
-        }
-
-        private void UpdatePanel()
-        {
-            if (_uiBroken || _uiText == null) return;
-            try
-            {
-                string text;
-                if (_zones.Count == 0)
-                {
-                    text = "探索收集  0 / 0";
-                }
-                else if (_zones.Count == 1)
-                {
-                    var z = _zones[0];
-                    text = z.Display + "\n探索收集  " + z.Done + " / " + z.Total;
-                }
-                else
-                {
-                    var sb = new System.Text.StringBuilder("探索收集");
-                    foreach (var z in _zones)
-                        sb.Append('\n').Append(z.Current ? ">> " : "   ")
-                          .Append(z.Display).Append("   ")
-                          .Append(z.Done).Append(" / ").Append(z.Total);
-                    text = sb.ToString();
-                }
-
-                _uiText.text = text;
-
-                int lines = text.Split('\n').Length;
-                _uiRootRect.sizeDelta = new Vector2(380f, 12f + 36f * lines);
-            }
-            catch (Exception e)
-            {
-                TearDownPanel(); // recreate on next eagle-eye open; not permanently broken
-                _uiBroken = true;
-                MelonLogger.Warning("progress panel update failed: " + e.Message);
-            }
-        }
+        // v0.4.0: the old top-left "探索收集 X/Y" progress panel was removed. The
+        // markers themselves (? / i / *) are the progress system: a marker means
+        // there is still content worth exploring; it disappears when completed.
 
         private void TickEagleEye()
         {
@@ -1773,14 +1976,11 @@ namespace CairnStoryTracker
 
                 if (shown && !_eagleWasShown)
                 {
-                    _uiBroken = false; // allow one fresh attempt per map open
                     EnsureModelFresh("eagle-open");
-                    if (EnsurePanel()) UpdatePanel();
                     SyncMarkers();
                 }
                 else if (!shown && _eagleWasShown)
                 {
-                    TearDownPanel();
                     TeardownMarkers();
                 }
 
@@ -1879,18 +2079,29 @@ namespace CairnStoryTracker
             DumpItems();
             DumpNearbyNarrative();
             DumpClassification();
+            DumpPersistence();
             DumpFieSpatial();
             DumpGroupVisualDiagnostic();
 
-            if (_zones.Count > 0)
-            {
-                var lines = _zones.Select(z => (z.Current ? "[current] " : "") + z.Display + " " + z.Done + "/" + z.Total);
-                MelonLogger.Msg("Tracked by zone: " + string.Join(" | ", lines) +
-                                " | trackedTotal=" + _trackedDone + "/" + _trackedTotal);
-            }
-            MelonLogger.Msg("UI: " + (_uiBroken ? "failed last attempt (retries next map open)" : _uiText == null ? "not created yet" : _eagleWasShown ? "visible" : "hidden (eagle-eye closed)"));
-
             MelonLogger.Msg("========== F8 SNAPSHOT END ==========");
+        }
+
+        private void DumpPersistence()
+        {
+            MelonLogger.Msg("=== Persistence ===");
+            MelonLogger.Msg("path=" + (_progressFilePath ?? "unresolved") +
+                            " loadState=" + _progressLoadState +
+                            " schema(current=v" + ProgressSchemaVersion +
+                            " file=" + (_progressLoadedSchemaVersion < 0
+                                ? "n/a"
+                                : "v" + _progressLoadedSchemaVersion.ToString(CultureInfo.InvariantCulture)) + ")" +
+                            " writeBlocked=" + _progressWriteBlocked);
+            MelonLogger.Msg("persistentLoreMembers=" + _persistentReadKeys.Count +
+                            " persistentCollectibles=" + _persistentCollectibleIds.Count +
+                            " sessionReadKeys=" + _sessionReadKeys.Count +
+                            " dirty=" + _progressFileDirty +
+                            " writerBusy=" + _progressWriterBusy +
+                            " lastSave=" + _progressLastSaveResult);
         }
 
         private void DumpStory()
@@ -1996,7 +2207,7 @@ namespace CairnStoryTracker
                 }
 
                 var locs = ItemLocations.Enumerate();
-                int empty = 0, remaining = 0, unresolved = 0, tracked = 0;
+                int empty = 0, remaining = 0, unresolved = 0, tracked = 0, persistentCompleted = 0;
 
                 foreach (var loc in locs)
                 {
@@ -2028,6 +2239,13 @@ namespace CairnStoryTracker
                         reason = cls.Value;
                     }
 
+                    // v0.4.0 diagnostics: where the tracker's completed state comes from.
+                    bool persistentDone = _persistentCollectibleIds.Contains(loc.Id);
+                    string completedSource = !isTracked ? "-"
+                        : rem == "True" ? (persistentDone ? "persistent" : "remaining")
+                        : rem == "False" ? (persistentDone ? "native+persistent" : "native")
+                        : (persistentDone ? "persistent" : "unknown");
+
                     string items = "[]";
                     try
                     {
@@ -2058,16 +2276,18 @@ namespace CairnStoryTracker
                         "       scene=" + Safe(() => loc.SceneName, "?") + " source=" + src + " items=[" + items + "]\n" +
                         "       remaining=" + rem + (remCount >= 0 ? "(" + remCount + ")" : "") +
                         " canLoot=" + canLoot + " tracked=" + (isTracked ? "True" : "False") + " reason=" + reason +
+                        " completedSource=" + completedSource +
                         markerTxt + " pos=" + Fmt(loc.Position));
 
                     if (rem == "True") remaining++;
                     else if (rem == "False") empty++;
                     if (isTracked) tracked++;
+                    if (isTracked && persistentDone) persistentCompleted++;
                 }
 
                 MelonLogger.Msg("Item summary: total=" + locs.Count + " remaining=" + remaining + " empty=" + empty +
                                 " providerUnresolved=" + unresolved + " providersInScene=" + providersInScene +
-                                " tracked=" + tracked);
+                                " tracked=" + tracked + " persistentCompleted=" + persistentCompleted);
 
                 if (_eagleWasShown)
                 {
@@ -3086,7 +3306,7 @@ namespace CairnStoryTracker
                                 "\n  members:");
                 foreach (var m in g.Members)
                     MelonLogger.Msg("  - " + (m.IsProvider ? "Provider" : "FocusElement") + " " + m.Path +
-                                    " read=" + (MemberIsRead(m) ? "True" : "False") +
+                                    " readSource=" + MemberReadSource(m) +
                                     " memberPos=" + Fmt(m.Pos) +
                                     " positionSource=" + (m.PositionSource ?? "ProviderTransform") +
                                     (m.CoveredByCollectible
@@ -3119,6 +3339,7 @@ namespace CairnStoryTracker
                             " visibleLore=" + (visiblePoi + visibleInfo) +
                             " (poiVisible=" + visiblePoi + " infoVisible=" + visibleInfo + ")" +
                             " sessionReadCount=" + _sessionReadKeys.Count +
+                            " persistentReadCount=" + _persistentReadKeys.Count +
                             " prefs(n/i/c)=" + PrefVisible(LoreCategory.NarrativePoi) + "/" +
                             PrefVisible(LoreCategory.WorldInfo) + "/" + PrefShowCollectible());
         }
@@ -3236,87 +3457,6 @@ namespace CairnStoryTracker
             return "(" + p.x.ToString("F1", CultureInfo.InvariantCulture) +
                    ", " + p.y.ToString("F1", CultureInfo.InvariantCulture) +
                    ", " + p.z.ToString("F1", CultureInfo.InvariantCulture) + ")";
-        }
-
-        /// <summary>"01_FirstRidge_Gameplay" -> "01_FirstRidge" (grouping key).</summary>
-        private static string GroupKey(string sceneName)
-        {
-            if (string.IsNullOrEmpty(sceneName)) return "unknown";
-            var k = sceneName;
-            foreach (var suf in new[] { "_Gameplay", "_GameplayDup", "_Art", "_ART", "_Audio", "_AUDIO", "_Camera", "_CAMERA", "_Holds", "_HOLDS", "_LOD" })
-            {
-                if (k.EndsWith(suf, StringComparison.OrdinalIgnoreCase))
-                {
-                    k = k.Substring(0, k.Length - suf.Length);
-                    break;
-                }
-            }
-            return k;
-        }
-
-        /// <summary>"01_FirstRidge" -> "First Ridge" (last-resort display when no official name is available).</summary>
-        private static string DisplayName(string key)
-        {
-            var m = Regex.Match(key, @"^(\d+)_(.+)$");
-            var s = m.Success ? m.Groups[2].Value : key;
-            s = Regex.Replace(s, "([a-z])([A-Z])", "$1 $2");
-            return string.IsNullOrEmpty(s) ? key : s;
-        }
-
-        /// <summary>
-        /// Official localized zone name (Priority 1: game's own LocalizationManager via
-        /// ZoneSceneData.zoneNameLocKey). Falls back to a small internal Chinese mapping
-        /// (Priority 2) and finally to the prettified internal name.
-        /// </summary>
-        private string ResolveZoneDisplay(string groupKey, string sceneName)
-        {
-            if (_officialZoneNames.TryGetValue(groupKey, out var cached)) return cached;
-
-            string official = null;
-            try
-            {
-                ZoneSceneData zsd = null;
-                try
-                {
-                    if (_currentZone != null &&
-                        string.Equals(_currentZone.name, groupKey, StringComparison.OrdinalIgnoreCase))
-                        zsd = _currentZone;
-                }
-                catch { }
-
-                if (zsd == null)
-                {
-                    Il2Cpp.WorldZoneData world = null;
-                    try { world = StreamingManager.Instance.World; } catch { }
-                    if (world == null) { try { world = CairnAPI.World.Current; } catch { } }
-
-                    if (world != null)
-                    {
-                        try { zsd = world.GetZoneSceneData(sceneName); } catch { }
-                        if (zsd == null) { try { zsd = world.GetZoneSceneData(groupKey); } catch { } }
-                    }
-                }
-
-                if (zsd != null)
-                {
-                    var lm = LocalizationManager.Instance;
-                    if (lm != null)
-                    {
-                        var s = lm.Get(zsd.zoneNameLocKey);
-                        if (!string.IsNullOrWhiteSpace(s)) official = s.Trim();
-                    }
-                }
-            }
-            catch { }
-
-            if (official != null)
-            {
-                _officialZoneNames[groupKey] = official;
-                return official;
-            }
-
-            if (ZoneNameFallbackZh.TryGetValue(groupKey, out var zh)) return zh;
-            return DisplayName(groupKey);
         }
     }
 }

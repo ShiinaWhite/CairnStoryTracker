@@ -6,6 +6,32 @@ All notable changes to CairnStoryTracker.
 
 Nothing yet.
 
+## 0.4.0
+
+Product semantics change: the tracker now records **player exploration
+knowledge**, not a mirror of the current game save.
+
+- Persistent monotonic exploration memory (`UserData/CairnStoryTracker/progress.json`,
+  schema v1): completions are added, never removed — game reloads, early-save
+  loads, or world rollbacks do not resurrect explored markers
+- Member-level Lore persistence (each completed `scene|path` member is saved;
+  group completion stays a runtime-derived state, so future members reappear as
+  `?` while old completions stay)
+- Stable collectible ID persistence (`UniquePersistentID` as decimal strings)
+- Legacy top-left X/Y progress panel removed — the `?` / `i` / `*` markers are
+  the progress system (collectible classification / eligibility is kept)
+- Native-completed bootstrap: on first run, save-proven completed providers and
+  taken collectibles are absorbed into the tracker memory
+- Background/deferred safe persistence: debounced writer on a plain-data
+  snapshot thread, tmp-file + replace write, corrupt / newer-schema files are
+  never overwritten (writes disabled for the session instead)
+- No in-game reset: deleting `progress.json` manually is the reset mechanism
+- F8: new Persistence section (path / load state / schema / counts / dirty /
+  writer state / last save), member `readSource` (native/persistent/session/
+  unread) and collectible `completedSource` diagnostics
+- Runtime verification by the owner is still pending (only minimal startup was
+  smoke-tested: mod load, zero exceptions)
+
 ## 0.3.18
 
 Performance stabilization:
