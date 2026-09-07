@@ -1,0 +1,15 @@
+bin/
+obj/
+*.dll
+*.pdb
+*.user
+*.suo
+.vs/
+.idea/
+
+# local game files / logs
+Logs/
+UserData/
+MelonLoader/
+Cairn_Data/
+*.log
