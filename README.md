@@ -1,56 +1,70 @@
 # CairnStoryTracker
 
-A lightweight exploration-assist mod for **Cairn / 孤山独影** (The Game Bakers), built on MelonLoader.
+Cairn / 《孤山独影》的探索辅助 Mod（MelonLoader + CairnAPI）。
 
-## Markers
+目标：帮助玩家在一次正常流程中更完整地发现 **叙事探索点**、**世界信息** 与 **特殊探索收集物**。它不是全物品地图，也不是作弊传送工具。
 
-| Icon | Meaning |
-|---|---|
-| `?` | Narrative POI — a lore location worth exploring (hidden caves, note boards, item-backed story spots) |
-| `i` | World info — signs, warnings and other environmental readables |
-| `◇`→`*` | Standalone collectible (pure exploration item with no lore identity) |
+## 标记语义
 
-Collectible-backed lore items (e.g. a note board that also contains a collectible) are **merged into their lore marker** — one place, one marker.
+```text
+? = 叙事探索点
+i = 世界信息
+* = 独立探索收集物
+```
 
-## Where markers appear
+说明：
 
-- **L1 survey view** (勘察岩壁): projected on-screen at the readables' world positions
-- **Eagle-eye fast-travel map**: pure-visual markers that never register as warp points and never pollute the native location list
+- 同一个 Lore 地点只显示一个 marker
+- 与 Collectible 属于同一底层内容的 Lore 阅读物会合并进 Lore marker（不会出现 `?` + `*` 这类重复标记）
+- 一个地点内所有内容都完成后，marker 自动消失
 
-A small progress panel shows per-zone collectible progress (official localized zone names).
+## 进度面板
 
-## Design principles
+打开 L1（勘察岩壁）或鹰眼地图时显示：
 
-- One narrative place = one marker (grouped by the level's `*_Lore` hierarchy)
-- Collectible identity (stable persistent ID) outranks lore identity — no `?`+`*` duplicates
-- Never writes to the game save; non-persistent readables only track "read" for the current session
-- Read/loot events never trigger background rescans — the model refreshes once, when you open a marker surface
+```text
+探索收集
+>> 峭壁   X / Y
+   拱岩   X / Y
+```
 
-## Requirements
+`X/Y` 只统计可靠持久化的特殊 Collectible；Lore/readable 不进入 X/Y。
+
+## 显示开关
+
+通过 CairnModOptions（或 `UserData/MelonPreferences.cfg`）可分别开关：叙事探索点 / 世界信息 / 特殊收集物。
+
+## 设计边界
+
+- 不修改游戏存档
+- 非持久化阅读物只记录**当前游戏 session** 的已读状态；退出游戏后这些 marker 会重新出现（设计行为，避免与游戏存档回档不同步）
+- 所有 marker 均为纯视觉辅助，不注册原生快速旅行点，不影响右侧地点列表
+- Collectible 的追踪 / remaining / X/Y 全部来自游戏自身数据，Mod 不保存进度
+
+## 依赖
 
 - Cairn
-- [MelonLoader](https://melonwiki.xyz/) 0.7.x (IL2CPP)
-- [CairnAPI](https://www.nexusmods.com/cairn/mods/21)
+- MelonLoader 0.7.x（IL2CPP）
+- CairnAPI（必须）
+- CairnModOptions（可选：提供游戏内设置界面；没有它时使用默认配置）
 
-## Build
+## 构建
 
-Requires the .NET 6 SDK. The build needs the game's generated interop assemblies, so point it at your install:
+需要 .NET 6 SDK，并指向本机游戏安装目录（用于引用 MelonLoader 生成的 interop 程序集）：
 
 ```bash
 dotnet build -c Release -p:GameDir="D:\Path\To\Cairn"
-# or set the CAIRN_GAME_DIR environment variable once and just run:
+# 或设置一次环境变量后直接：
 dotnet build -c Release
 ```
 
-## Install
+## 安装
 
-Copy `bin/Release/CairnStoryTracker.dll` into the game's `Mods/` folder (next to CairnAPI.dll).
+把 `bin/Release/CairnStoryTracker.dll` 复制到游戏的 `Mods/` 目录（与 CairnAPI.dll 同位置）。
 
-## Keys
+## 已知限制
 
-- `F8` — dump a full diagnostic snapshot to the MelonLoader log
-- Eagle-eye / L1 — markers appear automatically
-
-## Configuration
-
-Three toggles (CairnModOptions or `UserData/MelonPreferences.cfg`): show narrative POIs / show world info / show collectibles.
+- 非持久化阅读物的已读状态只在当前 session 有效
+- Lore 分类是保守的结构启发式（按 `*_Lore` 层级与成员数），不保证语义分类百分之百准确；所有内容都保留显示，不会因分类不确定而消失
+- 打开 L1 时会进行一次模型刷新，可能产生短暂帧时间峰值（实测约 134ms 量级）
+- `F8` 是重型诊断功能，按下时可能明显卡顿，仅供调试
