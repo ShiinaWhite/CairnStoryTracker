@@ -48,8 +48,9 @@ reappear. This is design behavior, not a bug.
 ### Collectible (special exploration items)
 - Source: `CairnAPI.ItemLocations` (`Enumerate()` / stable `UniquePersistentID`)
 - Fields used: `Id`, `Position`, `SceneName`, `Items`, `remaining` / `StocksEmpty`
-- X/Y progress comes **only** from tracked collectibles (v0.3.15-classified
-  families: letters, maps, GabRob, doll parts, flyers, journal, crystal shards…)
+- X/Y progress comes **only** from tracked collectibles (current
+  classified families: letters, maps, GabRob, doll parts, flyers, journal,
+  crystal shards…)
 
 ### ReadInteractionProvider
 World readable carrier for provider-backed objects (notes on walls, sign posts).
@@ -82,9 +83,11 @@ narrative completion.
 - POI identity: `scene + loreRoot + first child under the lore node`
   (e.g. `Crag_Lore/Beekeeper`, `Crag_Lore/02_Crag_Mapboard_Crag`)
 
-Important: `*_Lore` is the **world-readable content boundary**, verified
-runtime-wide (nonLore=0 across multiple zones). It is NOT a reliable
-Narrative-vs-WorldInfo semantic tag — both kinds live under it.
+Important: `*_Lore` is the **world-readable content boundary** — nonLore=0
+was observed in every investigated loaded gameplay scene so far. Treat that as
+a strong working assumption / boundary, NOT an exhaustive proof across the
+whole game. It is also NOT a reliable Narrative-vs-WorldInfo semantic tag —
+both kinds live under it.
 
 ## 5. RawCategory (conservative display classifier)
 

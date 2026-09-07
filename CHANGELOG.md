@@ -50,12 +50,14 @@ Marker semantics:
 
 ## 0.3.x earlier
 
-Broad milestones (details in git history):
+Broad milestones. The early 0.3.x work predates this public repository, so
+these are reconstructed from the development / runtime-investigation records —
+the git history here does not cover them:
 
 - Initial per-zone collectible X/Y tracker with Chinese UI
 - Quick-travel map markers with pure-visual safety (no native warp pollution)
 - L1 survey-view markers
 - Lore discovery: `*_Lore` grouping, ReadInteractionProvider /
   FocusInteractionElement carriers, session read tracking
-- Deferred FIE read correlation and native-pollution watchdogs
+- Native-pollution watchdogs
 - F8 diagnostics (zone snapshot, camera/marker/survey state, classification)
