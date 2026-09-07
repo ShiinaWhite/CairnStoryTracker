@@ -905,7 +905,7 @@ namespace CairnStoryTracker
                 var textGo = new GameObject("CairnStoryTracker.Toast");
                 textGo.AddComponent<RectTransform>();
                 textGo.transform.SetParent(_toastCanvas.transform, false);
-                var rt = (RectTransform)textGo.transform;
+                var rt = textGo.GetComponent<RectTransform>();
                 rt.anchorMin = new Vector2(0.5f, 0f);
                 rt.anchorMax = new Vector2(0.5f, 0f);
                 rt.pivot = new Vector2(0.5f, 0f);
@@ -1320,7 +1320,7 @@ namespace CairnStoryTracker
                     visualGo = new GameObject("CairnStoryTracker.MarkerVisual");
                     visualGo.AddComponent<RectTransform>();
                     visualGo.transform.SetParent(exampleParent, false);
-                    var vrt = (RectTransform)visualGo.transform;
+                    var vrt = visualGo.GetComponent<RectTransform>();
                     vrt.anchorMin = new Vector2(0.5f, 0.5f);
                     vrt.anchorMax = new Vector2(0.5f, 0.5f);
                     vrt.pivot = new Vector2(0.5f, 0.5f);
@@ -1511,7 +1511,7 @@ namespace CairnStoryTracker
                     var go = new GameObject("CairnStoryTracker.SurveyQ");
                     go.AddComponent<RectTransform>();
                     go.transform.SetParent(_surveyCanvas.transform, false);
-                    var rt = (RectTransform)go.transform;
+                    var rt = go.GetComponent<RectTransform>();
                     rt.anchorMin = new Vector2(0.5f, 0.5f);
                     rt.anchorMax = new Vector2(0.5f, 0.5f);
                     rt.pivot = new Vector2(0.5f, 0.5f);
@@ -1672,7 +1672,7 @@ namespace CairnStoryTracker
                 var root = new GameObject("CairnStoryTracker.Progress");
                 root.AddComponent<RectTransform>();
                 root.transform.SetParent(_uiCanvas.transform, false);
-                var rt = (RectTransform)root.transform;
+                var rt = root.GetComponent<RectTransform>();
                 rt.anchorMin = new Vector2(0f, 1f);
                 rt.anchorMax = new Vector2(0f, 1f);
                 rt.pivot = new Vector2(0f, 1f);
@@ -1686,7 +1686,7 @@ namespace CairnStoryTracker
                 var textGo = new GameObject("Text");
                 textGo.AddComponent<RectTransform>();
                 textGo.transform.SetParent(rt, false);
-                var trt = (RectTransform)textGo.transform;
+                var trt = textGo.GetComponent<RectTransform>();
                 trt.anchorMin = Vector2.zero;
                 trt.anchorMax = Vector2.one;
                 trt.offsetMin = new Vector2(12f, 8f);
