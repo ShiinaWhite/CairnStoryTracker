@@ -198,6 +198,9 @@ namespace CairnStoryTracker
         }
 
         private readonly List<LoreGroup> _loreGroups = new List<LoreGroup>();
+        // v0.4.0 durability: true while _loreGroups reflects the current scene
+        // structure, enabling zero-scan immediate FIE correlation at READ STOP.
+        private bool _loreCacheValid;
         private readonly HashSet<string> _sessionReadKeys = new HashSet<string>(); // memory only, never persisted
         private readonly Dictionary<ulong, (string groupIdentity, LoreCategory rawCategory)> _collectibleCoveredByLore =
             new Dictionary<ulong, (string, LoreCategory)>(); // stable PID -> merged into lore marker
@@ -216,7 +219,7 @@ namespace CairnStoryTracker
         private readonly HashSet<string> _persistentReadKeys = new HashSet<string>();
         private readonly HashSet<ulong> _persistentCollectibleIds = new HashSet<ulong>();
         private volatile bool _progressWriterBusy;        // at most one background writer at a time
-        private bool _progressFileDirty;
+        private volatile bool _progressFileDirty;         // also set by the writer thread on save failure
         private bool _progressWasBusy;                    // busy transition watcher (main thread)
         private float _progressSaveNotBefore;             // debounce window
         private string _progressLastSaveResult = "no save attempted yet";
@@ -690,6 +693,7 @@ namespace CairnStoryTracker
 
             _loreGroups.AddRange(groups.Values);
             _loreGroups.Sort((a, b) => string.Compare(a.Identity, b.Identity, StringComparison.OrdinalIgnoreCase));
+            _loreCacheValid = true; // deferred FIE correlation may now use this cache directly
         }
 
         private bool LoreGroupVisible(LoreGroup g)
@@ -820,23 +824,74 @@ namespace CairnStoryTracker
                 }
                 else if (data != null)
                 {
-                    // v0.3.18 perf: no FIE scan here. Record a lightweight pending read;
-                    // correlation is resolved inside the next BuildLoreGroups FIE pass.
+                    // v0.4.0 durability: resolve from the ALREADY BUILT lore cache when
+                    // possible, so a read followed by quitting without opening L1/F8
+                    // still reaches persistent memory. No scene scan happens here —
+                    // only the cached _loreGroups members are inspected.
+                    IntPtr ptr = default;
+                    Vector3 playerPos = default;
+                    bool resolved = false;
                     try
                     {
-                        _pendingFocusReads.Add(new PendingFocusRead
-                        {
-                            ReadDataPointer = data.Pointer,
-                            PlayerPos = GetPlayerPos(out _),
-                        });
+                        ptr = data.Pointer;
+                        playerPos = GetPlayerPos(out _);
+                        resolved = TryResolveFocusReadFromCache(ptr, playerPos);
                     }
                     catch { }
+
+                    if (!resolved)
+                    {
+                        // v0.3.18 perf: no FIE scan here. Record a lightweight pending read;
+                        // correlation is resolved inside the next BuildLoreGroups FIE pass.
+                        try
+                        {
+                            _pendingFocusReads.Add(new PendingFocusRead
+                            {
+                                ReadDataPointer = ptr,
+                                PlayerPos = playerPos,
+                            });
+                        }
+                        catch { }
+                    }
                     MarkModelDirty();
                 }
 
                 MelonLogger.Msg("READ STOP: " + n + (t != null ? " il2cpp=" + t : ""));
             }
             catch (Exception e) { MelonLogger.Warning("read-stop handler error: " + e.Message); }
+        }
+
+        /// <summary>
+        /// v0.4.0 durability: resolve a focus read against the ALREADY BUILT
+        /// _loreGroups cache — no Renderer/hierarchy access, no FindObjectsOfType.
+        /// Same conservative rule as the deferred pass: read-data pointer identity +
+        /// interaction distance, UNIQUE match only. Returns false when the cache is
+        /// unavailable or the match is not unique; the caller then records a pending
+        /// read for the existing deferred fallback (never guess).
+        /// </summary>
+        private bool TryResolveFocusReadFromCache(IntPtr readDataPointer, Vector3 playerPos)
+        {
+            if (!_loreCacheValid || readDataPointer == IntPtr.Zero) return false;
+
+            LoreMember match = null;
+            int matchCount = 0;
+            foreach (var g in _loreGroups)
+            {
+                foreach (var m in g.Members)
+                {
+                    if (m.IsProvider) continue;
+                    if (m.ReadDataPointer != readDataPointer) continue;
+                    if ((m.InteractionPos - playerPos).sqrMagnitude > NearbyRadius * NearbyRadius) continue;
+                    matchCount++;
+                    match = m;
+                }
+            }
+            if (matchCount != 1 || match == null) return false;
+
+            _sessionReadKeys.Add(match.Key);
+            RememberLoreMemberRead(match.Key);
+            MelonLogger.Msg("SESSION READ (focus, cached): " + match.Key);
+            return true;
         }
 
         private void OnEnterReadProvider(Il2Cpp.ReadInteractionProvider provider)
@@ -867,6 +922,7 @@ namespace CairnStoryTracker
             // schedule a progress refresh (streaming composition changed).
             _nextSubAttemptAt = 0f;
             if (!_lootSubscribed) SubscribeLoot();
+            _loreCacheValid = false; // cached member structure may no longer match the loaded world
             MarkModelDirty();
         }
 
@@ -1203,6 +1259,7 @@ namespace CairnStoryTracker
             Task.Run(() =>
             {
                 string result;
+                bool failed = false;
                 try
                 {
                     Directory.CreateDirectory(dir);
@@ -1213,23 +1270,45 @@ namespace CairnStoryTracker
                 }
                 catch (Exception e)
                 {
+                    failed = true;
                     result = "FAILED: " + e.Message;
                 }
                 _progressLastSaveResult = result;
+                if (failed)
+                {
+                    // The data is NOT safely on disk: restore dirty so a later tick
+                    // retries. Volatile + write-before-busy=false keeps this visible
+                    // to the main thread. Success must NOT clear dirty here — new
+                    // revisions added during the write stay flagged.
+                    _progressFileDirty = true;
+                }
                 _progressWriterBusy = false;
             });
         }
 
-        /// <summary>Final synchronous flush at shutdown (the game is exiting; blocking is fine).</summary>
+        /// <summary>Final synchronous flush at shutdown (the game is exiting; blocking is fine).
+        /// Order matters: wait for an in-flight background writer FIRST — StartProgressSave
+        /// clears the dirty flag when it starts, so a dirty check before waiting could
+        /// abandon data the writer has not finished persisting.</summary>
         private void FlushProgressFileNow()
         {
-            if (_progressWriteBlocked || !_progressFileDirty) return;
-            for (int i = 0; i < 150 && _progressWriterBusy; i++) Thread.Sleep(20); // ≤3s: let an in-flight write finish
+            if (_progressWriteBlocked) return;
+
             if (_progressWriterBusy)
             {
-                MelonLogger.Warning("PERSISTENCE: background writer still busy at shutdown; final flush skipped");
-                return;
+                for (int i = 0; i < 150 && _progressWriterBusy; i++) Thread.Sleep(20); // ≤3s: let the in-flight write finish
+                if (_progressWriterBusy)
+                {
+                    // Never write concurrently to the same tmp file — give up instead.
+                    MelonLogger.Warning("PERSISTENCE: background writer still busy at shutdown; final flush skipped");
+                    return;
+                }
+                if (_progressLastSaveResult.StartsWith("FAILED", StringComparison.Ordinal))
+                    _progressFileDirty = true; // the in-flight write failed: data not on disk
             }
+
+            if (!_progressFileDirty) return; // writer done (or none ran) and nothing unsaved
+
             try
             {
                 Directory.CreateDirectory(_progressDir);
@@ -2102,6 +2181,8 @@ namespace CairnStoryTracker
                             " dirty=" + _progressFileDirty +
                             " writerBusy=" + _progressWriterBusy +
                             " lastSave=" + _progressLastSaveResult);
+            MelonLogger.Msg("pendingFocusReads=" + _pendingFocusReads.Count +
+                            " loreCacheValid=" + _loreCacheValid);
         }
 
         private void DumpStory()
